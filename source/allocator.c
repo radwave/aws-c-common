@@ -15,8 +15,10 @@
 
 #include <aws/common/assert.h>
 #include <aws/common/common.h>
+#include <aws/common/linked_list.h>
 #include <aws/common/logging.h>
 #include <aws/common/math.h>
+#include <aws/common/mutex.h>
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -171,6 +173,94 @@ cleanup:
 }
 
 #undef AWS_ALIGN_ROUND_UP
+
+#define MAX_STACK_DEPTH 8
+
+struct memory_tracking_block {
+    size_t total_size;
+    struct aws_linked_list_node node;
+    void *raw_stack_frames[MAX_STACK_DEPTH];
+};
+
+struct tracking_allocator_impl {
+    struct aws_mutex lock;
+    struct aws_linked_list allocations;
+
+    size_t total_allocations;
+    size_t total_user_bytes_allocated;
+
+    size_t outstanding_allocations;
+    size_t outstanding_user_bytes;
+};
+
+static void s_fill_in_callstack_frames(struct memory_tracking_block *block) {
+    fill_backtrace_frames(block->raw_stack_frames, MAX_STACK_DEPTH, 3);
+}
+
+static void *s_tracking_malloc(struct aws_allocator *allocator, size_t size) {
+    struct tracking_allocator_impl *impl = allocator->impl;
+
+    size_t tracking_size = size + sizeof(struct memory_tracking_block);
+
+    void *raw_memory = malloc(tracking_size);
+    if (raw_memory == NULL) {
+        return NULL;
+    }
+
+    struct memory_tracking_block* block = raw_memory;
+    AWS_ZERO_STRUCT(*block);
+    block->total_size = tracking_size;
+    s_fill_in_callstack_frames(block);
+
+    aws_mutex_lock(&impl->lock);
+
+    aws_linked_list_push_front(&impl->allocations, &block->node);
+
+    ++impl->total_allocations;
+    impl->total_user_bytes_allocated += size;
+
+    ++impl->outstanding_allocations;
+    impl->outstanding_user_bytes += size;
+
+    aws_mutex_unlock(&impl->lock);
+
+    void *user_memory = ((uint8_t *)raw_memory + sizeof(struct memory_tracking_block));
+
+    return user_memory;
+}
+
+static void s_tracking_free(struct aws_allocator *allocator, void *ptr) {
+    struct tracking_allocator_impl *impl = allocator->impl;
+
+    void *original_raw_memory = ((uint8_t *)ptr) - sizeof(struct memory_tracking_block);
+    struct memory_tracking_block *block = original_raw_memory;
+
+    aws_mutex_lock(&impl->lock);
+
+    aws_linked_list_remove(&block->node);
+
+    --impl->outstanding_allocations;
+    impl->outstanding_user_bytes -= block->total_size;
+
+    aws_mutex_unlock(&impl->lock);
+
+    free(original_raw_memory);
+}
+
+static struct tracking_allocator_impl s_tracking_impl = {
+    .lock = AWS_MUTEX_INIT
+};
+
+static struct aws_allocator tracking_allocator = {
+    .mem_acquire = s_tracking_malloc,
+    .mem_release = s_tracking_free,
+    .mem_realloc = NULL,
+    .mem_calloc = NULL,
+    .impl = &s_tracking_impl
+};
+
+
+
 
 void aws_mem_release(struct aws_allocator *allocator, void *ptr) {
     AWS_FATAL_PRECONDITION(allocator != NULL);
