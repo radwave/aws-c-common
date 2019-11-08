@@ -12,7 +12,6 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-
 #include <aws/common/system_info.h>
 
 #include <aws/common/byte_buf.h>
@@ -105,6 +104,7 @@ void aws_debug_break(void) {
 
 #    define AWS_BACKTRACE_DEPTH 128
 
+#pragma message("AWS_HAVE_EXECINFO")
 struct aws_stack_frame_info {
     char exe[PATH_MAX];
     char addr[32];
@@ -368,6 +368,19 @@ void aws_backtrace_print(FILE *fp, void *call_site_data) {
 }
 
 #else
+#pragma message("DONT AWS_HAVE_EXECINFO")
+char **aws_backtrace_addr2line(void *const *stack_frames, size_t stack_depth) {
+    // NOTE: I just copied the above, but ripped out the guts, leaving enough
+    // for the caller freeing to be effective??
+    struct aws_byte_buf lines;
+    aws_byte_buf_init(&lines, aws_default_allocator(), stack_depth * 256);
+
+    /* insert pointers for each stack entry */
+    memset(lines.buffer, 0, stack_depth * sizeof(void *));
+    lines.len += stack_depth * sizeof(void *);
+    return (char **)lines.buffer; /* caller is responsible for freeing */
+}
+
 void aws_backtrace_print(FILE *fp, void *call_site_data) {
     (void)call_site_data;
     fprintf(fp, "No call stack information available\n");
